@@ -63,6 +63,7 @@ static const PrefixEntry kDirParents[] = {
 
 static const PrefixEntry kProcFilterKeywords[] = {
     PE("lineage"), PE("Lineage"), PE("evolution"), PE("Evolution"),
+    PE("resurrection"), PE("Resurrection"), PE("ResurrectionRemix"),
     PE("omnirom"), PE("aospa"),
     { nullptr, 0 }
 };
@@ -470,7 +471,8 @@ static bool line_has_blocked_segment(const char* line) {
             char before = (p == line) ? '/' : p[-1];
             char after = p[kw->len];
             bool lb = before == '/' || before == ' ' || before == '\0';
-            bool rb = after == '/' || after == ' ' || after == '.' || after == '\0' || after == '\n';
+            bool rb = after == '/' || after == ' ' || after == '.' || after == '-'
+                    || after == '_' || after == '\0' || after == '\n';
             if (lb && rb) return true;
             p += kw->len;
         }
@@ -691,7 +693,9 @@ int custom_rom_hide_filter_sepolicy(const char* path) {
     if (!match) { errno = saved_errno; return -1; }
 
     int mem_fd = filter_file_with(path, [](const char* line, void*) {
-        return strstr(line, "lineage") != nullptr;
+        return strstr(line, "lineage") != nullptr
+                || strstr(line, "resurrection") != nullptr
+                || strstr(line, "Resurrection") != nullptr;
     }, write_line_raw, nullptr);
     errno = saved_errno;
     return mem_fd;
@@ -713,7 +717,8 @@ static const char* const kVintfFilterPaths[] = {
 };
 
 static const char* const kVintfFilterKeywords[] = {
-    "lineage", "Lineage", "evolution", "Evolution", nullptr
+    "lineage", "Lineage", "evolution", "Evolution",
+    "resurrection", "Resurrection", nullptr
 };
 #endif
 
@@ -764,8 +769,10 @@ int custom_rom_hide_filter_vintf(const char* path) {
 }
 
 static const char* const kSpoofedEmptyProps[] = {
+    "ro.rr.version", "ro.rr.display.version", "ro.rr.device",
     "ro.evolution.version", "ro.evolution.build.version", "ro.evolution.display.version",
-    "ro.lineage.version", "ro.lineage.build.version", "ro.cm.build.version",
+    "ro.lineage.version", "ro.lineage.display.version", "ro.lineage.build.version",
+    "ro.lineage.releasetype", "ro.cm.build.version",
     "ro.modversion", "init.svc_debug_pid.adb_root",
     "init.svc.adb_root", "service.adb.root", nullptr
 };
