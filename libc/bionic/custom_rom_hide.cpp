@@ -64,6 +64,7 @@ static const PrefixEntry kDirParents[] = {
 static const PrefixEntry kProcFilterKeywords[] = {
     PE("lineage"), PE("Lineage"), PE("evolution"), PE("Evolution"),
     PE("resurrection"), PE("Resurrection"), PE("ResurrectionRemix"),
+    PE("resurrected"), PE("Resurrected"), PE("ResurrectedRemix"),
     PE("omnirom"), PE("aospa"),
     { nullptr, 0 }
 };
@@ -694,8 +695,8 @@ int custom_rom_hide_filter_sepolicy(const char* path) {
 
     int mem_fd = filter_file_with(path, [](const char* line, void*) {
         return strstr(line, "lineage") != nullptr
-                || strstr(line, "resurrection") != nullptr
-                || strstr(line, "Resurrection") != nullptr;
+                || strstr(line, "resurrect") != nullptr
+                || strstr(line, "Resurrect") != nullptr;
     }, write_line_raw, nullptr);
     errno = saved_errno;
     return mem_fd;
@@ -718,7 +719,7 @@ static const char* const kVintfFilterPaths[] = {
 
 static const char* const kVintfFilterKeywords[] = {
     "lineage", "Lineage", "evolution", "Evolution",
-    "resurrection", "Resurrection", nullptr
+    "resurrect", "Resurrect", nullptr
 };
 #endif
 
