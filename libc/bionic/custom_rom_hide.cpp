@@ -801,7 +801,7 @@ static const PropOverride kSpoofedValueProps[] = {
     {nullptr, nullptr}
 };
 
-// Read-only keys that mirror whatever AxSpoofManager staged into the matching
+// Read-only keys that mirror whatever RrSpoofManager staged into the matching
 // persist.sys.pif.* prop after a fingerprint refresh. Unlike kSpoofedValueProps
 // these have no fixed value — read at call time, only applied when the staging
 // prop is actually set (empty = no PIF config loaded yet, so don't blank out the
@@ -899,10 +899,10 @@ static bool is_hidden_staging_prop(const char* name) {
 }
 
 // Entries from the PIF config that the tables above don't cover: exact property names and
-// leading-* suffix wildcards, like PIFork's jsonProps. AxSpoofManager stages them as
+// leading-* suffix wildcards, like PIFork's jsonProps. RrSpoofManager stages them as
 // persist.sys.pif.x.<i> = "name=value" ("*suffix=value" for a wildcard), sorted by key, with
 // persist.sys.pif.x.count saying how many slots are live. Keep the names and the slot limit
-// in sync with AxSpoofManager.
+// in sync with RrSpoofManager.
 //
 // Like PIFork an exact match beats every wildcard, and the first matching wildcard wins.
 // A bare "*" is ignored, since it would match every property. Only called from the
