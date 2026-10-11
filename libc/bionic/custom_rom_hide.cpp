@@ -216,20 +216,23 @@ static bool is_app_process() {
     return result;
 }
 
-// Dynamic prop overrides are only meant for DroidGuard, mirroring PIFork's scope.
+// Dynamic prop overrides mirror PIFork's DroidGuard scope, plus Google Wallet
+// and GPay. Those apps compare the props they read with the attestation
+// certificate, and CertificateHacker rewrites that certificate to the PIF
+// identity for every TrickyStore target. DroidGuard already sees the PIF
+// identity, so Play Integrity agrees with it. Wallet was still served the real
+// device, so its local check failed while RCS and the Play Store passed.
 // The process name is only final once ActivityThread has called Process.setArgV0(),
 // before that cmdline still reads "zygote*" or "<pre-initialized>". Only cache
 // once it is final so an early read can't pin the wrong answer for this pid.
 #define DROIDGUARD_PROCESS_NAME "com.google.android.gms.unstable"
 
-static bool compute_droidguard(bool* resolved) {
+static bool read_final_cmdline(char* cmdline, size_t size, bool* resolved) {
     *resolved = false;
-
     int fd = raw_openat("/proc/self/cmdline", O_RDONLY);
     if (fd < 0) return false;
 
-    char cmdline[256];
-    ssize_t n = raw_read(fd, cmdline, sizeof(cmdline) - 1);
+    ssize_t n = raw_read(fd, cmdline, size - 1);
     raw_close(fd);
     if (n <= 0) return false;
 
@@ -237,9 +240,35 @@ static bool compute_droidguard(bool* resolved) {
     if (strncmp(cmdline, "zygote", 6) == 0 || strcmp(cmdline, "<pre-initialized>") == 0) {
         return false;
     }
-
     *resolved = true;
+    return true;
+}
+
+// Main process and ":subprocess" names. A longer package that only shares the
+// prefix must not match.
+static bool cmdline_is_package(const char* cmdline, const char* package_name) {
+    size_t n = strlen(package_name);
+    if (strncmp(cmdline, package_name, n) != 0) return false;
+    return cmdline[n] == '\0' || cmdline[n] == ':';
+}
+
+static bool compute_droidguard(bool* resolved) {
+    char cmdline[256];
+    if (!read_final_cmdline(cmdline, sizeof(cmdline), resolved)) return false;
     return strcmp(cmdline, DROIDGUARD_PROCESS_NAME) == 0;
+}
+
+static bool compute_wallet(bool* resolved) {
+    char cmdline[256];
+    if (!read_final_cmdline(cmdline, sizeof(cmdline), resolved)) return false;
+    // gms.ui draws the card screen. TapAndPayService itself runs in the main
+    // com.google.android.gms process (and persistent). Exact names only, so
+    // this does not match com.google.android.gms.unstable.
+    return cmdline_is_package(cmdline, "com.google.android.apps.walletnfcrel")
+            || cmdline_is_package(cmdline, "com.google.android.apps.nbu.paisa.user")
+            || cmdline_is_package(cmdline, "com.google.android.gms.ui")
+            || cmdline_is_package(cmdline, "com.google.android.gms")
+            || cmdline_is_package(cmdline, "com.google.android.gms.persistent");
 }
 
 static bool is_droidguard_process() {
@@ -259,6 +288,29 @@ static bool is_droidguard_process() {
     }
     return result;
 }
+
+static bool is_wallet_process() {
+    static _Atomic(pid_t) cached_pid = -1;
+    static _Atomic(bool) cached_value = false;
+
+    pid_t cur = getpid();
+    if (atomic_load_explicit(&cached_pid, memory_order_acquire) == cur) {
+        return atomic_load_explicit(&cached_value, memory_order_acquire);
+    }
+
+    bool resolved = false;
+    bool result = compute_wallet(&resolved);
+    if (resolved) {
+        atomic_store_explicit(&cached_value, result, memory_order_release);
+        atomic_store_explicit(&cached_pid, cur, memory_order_release);
+    }
+    return result;
+}
+
+// Set while an override lookup reads persist.sys.pif.* staging props, so that
+// read is not blanked and does not re-enter the wallet __system_property_get
+// path. The loader cannot use ELF TLS, so this is process-wide.
+static _Atomic(int) g_staging_read_depth = 0;
 
 static const char* path_basename(const char* path) {
     const char* slash = strrchr(path, '/');
@@ -806,7 +858,7 @@ static const PropOverride kSpoofedValueProps[] = {
 // persist.sys.pif.* prop after a fingerprint refresh. Unlike kSpoofedValueProps
 // these have no fixed value — read at call time, only applied when the staging
 // prop is actually set (empty = no PIF config loaded yet, so don't blank out the
-// real device identity), and only served to the DroidGuard process.
+// real device identity), and only served to DroidGuard and Google Wallet.
 struct DynamicPropOverride { const char* name; const char* staging_name; };
 static const DynamicPropOverride kDynamicProductProps[] = {
     {"ro.product.manufacturer",        "persist.sys.pif.product.manufacturer"},
@@ -823,6 +875,14 @@ static const DynamicPropOverride kDynamicProductProps[] = {
     {"ro.build.product",               "persist.sys.pif.product.device"},
     {"ro.build.description",           "persist.sys.pif.build.description"},
     {"ro.build.flavor",                "persist.sys.pif.build.flavor"},
+    // KeyMint device-id props. Wallet and the generate path read these
+    // separately from ro.product.model, and they have to name the same device
+    // the attestation certificate claims.
+    {"ro.product.brand_for_attestation",        "persist.sys.pif.product.brand"},
+    {"ro.product.device_for_attestation",       "persist.sys.pif.product.device"},
+    {"ro.product.manufacturer_for_attestation", "persist.sys.pif.product.manufacturer"},
+    {"ro.product.model_for_attestation",        "persist.sys.pif.product.model"},
+    {"ro.product.name_for_attestation",         "persist.sys.pif.product.name"},
     {nullptr, nullptr}
 };
 
@@ -867,13 +927,14 @@ static const DynamicSuffixOverride kDynamicSuffixProps[] = {
     // system_ext, bootimage, ...), taken from the fingerprint instead of a fixed value.
     DYNAMIC_SUFFIX(".build.type",      "persist.sys.pif.build.type"),
     DYNAMIC_SUFFIX(".build.tags",      "persist.sys.pif.build.tags"),
+    // ro.build.fingerprint and ro.<partition>.build.fingerprint.
+    DYNAMIC_SUFFIX(".build.fingerprint", "persist.sys.pif.fingerprint"),
     {nullptr, 0, nullptr}
 };
 
-// Fixed values served to DroidGuard only, as PIFork's property hook does. adbd
-// and USB state are read by init, system_server and Settings, none of which are
-// app processes, so they keep the real values. Only the property callback path
-// applies these, like the dynamic tables above.
+// Fixed values served to DroidGuard and Google Wallet, as PIFork's property hook
+// does for DroidGuard. adbd and USB state are read by init, system_server and
+// Settings, none of which are app processes, so they keep the real values.
 static const PropOverride kDroidGuardValueProps[] = {
     {"init.svc.adbd", "stopped"},
     {"sys.usb.state", "mtp"},
@@ -895,6 +956,10 @@ static const DynamicSuffixOverride* find_dynamic_suffix_override(const char* nam
 #define PIF_STAGING_PROP_PREFIX "persist.sys.pif."
 
 static bool is_hidden_staging_prop(const char* name) {
+    // An override lookup has to read the staging props back. That read goes
+    // through __system_property_get, which would otherwise blank them for
+    // Wallet (DroidGuard is already allowed to see them).
+    if (atomic_load_explicit(&g_staging_read_depth, memory_order_relaxed) > 0) return false;
     return strncmp(name, PIF_STAGING_PROP_PREFIX, sizeof(PIF_STAGING_PROP_PREFIX) - 1) == 0 &&
            !is_droidguard_process();
 }
@@ -972,6 +1037,23 @@ bool custom_rom_hide_should_spoof_prop(const char* name, char* value) {
     for (const PropOverride* o = kSpoofedValueProps; o->name; ++o) {
         if (strcmp(name, o->name) == 0) { strcpy(value, o->value); return true; }
     }
+    // __system_property_get does not use the callback override below. Wallet,
+    // gms.ui, and the main GMS process (TapAndPayService) use this entry point,
+    // so serve them the same PIF props. DroidGuard stays on the callback path
+    // it already passes with.
+    if (atomic_load_explicit(&g_staging_read_depth, memory_order_relaxed) == 0
+            && is_wallet_process()) {
+        const char* override_val = custom_rom_hide_get_prop_override(name, value);
+        if (override_val) {
+            if (override_val != value) {
+                size_t n = strlen(override_val);
+                if (n >= PROP_VALUE_MAX) n = PROP_VALUE_MAX - 1;
+                memcpy(value, override_val, n);
+                value[n] = '\0';
+            }
+            return true;
+        }
+    }
     return false;
 }
 
@@ -985,13 +1067,24 @@ bool custom_rom_hide_should_hide_prop(const char* name) {
     return false;
 }
 
+static const char* custom_rom_hide_get_prop_override_impl(const char* name, char* buffer);
+
 const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     if (!name || reinterpret_cast<uintptr_t>(name) < 0x1000000) return nullptr;
     if (!is_app_process()) return nullptr;
-    // is_droidguard_process() is cached per pid once the process name is final.
-    const bool droidguard = is_droidguard_process();
+    atomic_fetch_add_explicit(&g_staging_read_depth, 1, memory_order_relaxed);
+    const char* result = custom_rom_hide_get_prop_override_impl(name, buffer);
+    atomic_fetch_sub_explicit(&g_staging_read_depth, 1, memory_order_relaxed);
+    return result;
+}
+
+static const char* custom_rom_hide_get_prop_override_impl(const char* name, char* buffer) {
+    // Cached per pid once the process name is final. Wallet and the GMS process
+    // that runs TapAndPay have to see the same identity DroidGuard does: the
+    // certificate was already rewritten to it.
+    const bool identity = is_droidguard_process() || is_wallet_process();
     // An exact entry from the PIF config wins over everything below, as in PIFork.
-    if (droidguard) {
+    if (identity) {
         if (const char* v = find_custom_prop_override(name, buffer, false)) return v;
     }
     for (const PropOverride* o = kSpoofedValueProps; o->name; ++o) {
@@ -999,7 +1092,7 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     }
     for (const DynamicPropOverride* o = kDynamicProductProps; o->name; ++o) {
         if (strcmp(name, o->name) == 0) {
-            if (!droidguard) return nullptr;
+            if (!identity) return nullptr;
             // This code is also linked into the loader, which cannot contain ELF TLS.
             // The caller owns a PROP_VALUE_MAX buffer for the duration of the read.
             int len = __system_property_get(o->staging_name, buffer);
@@ -1008,23 +1101,23 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
         }
     }
     if (const char* staging = find_product_partition_staging(name)) {
-        if (!droidguard) return nullptr;
+        if (!identity) return nullptr;
         int len = __system_property_get(staging, buffer);
         if (len > 0) return buffer;
         return nullptr;
     }
     if (const DynamicSuffixOverride* o = find_dynamic_suffix_override(name)) {
-        if (!droidguard) return nullptr;
+        if (!identity) return nullptr;
         int len = __system_property_get(o->staging_name, buffer);
         if (len > 0) return buffer;
     }
     for (const PropOverride* o = kDroidGuardValueProps; o->name; ++o) {
         if (strcmp(name, o->name) == 0) {
-            return droidguard ? o->value : nullptr;
+            return identity ? o->value : nullptr;
         }
     }
     // Wildcard entries from the PIF config apply last, after the fixed tables.
-    if (droidguard) return find_custom_prop_override(name, buffer, true);
+    if (identity) return find_custom_prop_override(name, buffer, true);
     return nullptr;
 }
 
