@@ -217,11 +217,9 @@ static bool is_app_process() {
 }
 
 // Dynamic prop overrides mirror PIFork's DroidGuard scope, plus Google Wallet
-// and GPay. Those apps compare the props they read with the attestation
-// certificate, and CertificateHacker rewrites that certificate to the PIF
-// identity for every TrickyStore target. DroidGuard already sees the PIF
-// identity, so Play Integrity agrees with it. Wallet was still served the real
-// device, so its local check failed while RCS and the Play Store passed.
+// and TapAndPay. DroidGuard keeps the canary PIF identity. Wallet and the GMS
+// process that hosts TapAndPay get the stable certified identity staged in
+// persist.sys.pif.w.*, because Wallet rejects a canary fingerprint.
 // The process name is only final once ActivityThread has called Process.setArgV0(),
 // before that cmdline still reads "zygote*" or "<pre-initialized>". Only cache
 // once it is final so an early read can't pin the wrong answer for this pid.
@@ -1078,13 +1076,64 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     return result;
 }
 
+// Wallet props stay under PROP_NAME_MAX. Empty means "use the builtin stable
+// kodiak release" so a process started before system_server stages them still
+// matches the certificate.
+static const char* wallet_prop_name(const char* canary_name) {
+    if (strcmp(canary_name, "persist.sys.pif.product.manufacturer") == 0) return "persist.sys.pif.w.mfr";
+    if (strcmp(canary_name, "persist.sys.pif.product.brand") == 0) return "persist.sys.pif.w.brand";
+    if (strcmp(canary_name, "persist.sys.pif.product.model") == 0) return "persist.sys.pif.w.model";
+    if (strcmp(canary_name, "persist.sys.pif.product.device") == 0) return "persist.sys.pif.w.device";
+    if (strcmp(canary_name, "persist.sys.pif.product.name") == 0) return "persist.sys.pif.w.name";
+    if (strcmp(canary_name, "persist.sys.pif.build.id") == 0) return "persist.sys.pif.w.id";
+    if (strcmp(canary_name, "persist.sys.pif.security_patch") == 0) return "persist.sys.pif.w.patch";
+    if (strcmp(canary_name, "persist.sys.pif.api_level") == 0) return "persist.sys.pif.w.api";
+    if (strcmp(canary_name, "persist.sys.pif.build.type") == 0) return "persist.sys.pif.w.type";
+    if (strcmp(canary_name, "persist.sys.pif.build.tags") == 0) return "persist.sys.pif.w.tags";
+    if (strcmp(canary_name, "persist.sys.pif.build.description") == 0) return "persist.sys.pif.w.desc";
+    if (strcmp(canary_name, "persist.sys.pif.build.flavor") == 0) return "persist.sys.pif.w.flavor";
+    if (strcmp(canary_name, "persist.sys.pif.fingerprint") == 0) return "persist.sys.pif.w.fp";
+    return nullptr;
+}
+
+static const char* wallet_builtin(const char* canary_name) {
+    if (strcmp(canary_name, "persist.sys.pif.product.manufacturer") == 0) return "Google";
+    if (strcmp(canary_name, "persist.sys.pif.product.brand") == 0) return "google";
+    if (strcmp(canary_name, "persist.sys.pif.product.model") == 0) return "Pixel 11 Pro XL";
+    if (strcmp(canary_name, "persist.sys.pif.product.device") == 0) return "kodiak";
+    if (strcmp(canary_name, "persist.sys.pif.product.name") == 0) return "kodiak";
+    if (strcmp(canary_name, "persist.sys.pif.build.id") == 0) return "CD1A.260905.001.B1";
+    if (strcmp(canary_name, "persist.sys.pif.security_patch") == 0) return "2026-09-05";
+    if (strcmp(canary_name, "persist.sys.pif.api_level") == 0) return "32";
+    if (strcmp(canary_name, "persist.sys.pif.build.type") == 0) return "user";
+    if (strcmp(canary_name, "persist.sys.pif.build.tags") == 0) return "release-keys";
+    if (strcmp(canary_name, "persist.sys.pif.build.flavor") == 0) return "kodiak-user";
+    if (strcmp(canary_name, "persist.sys.pif.build.description") == 0) {
+        return "kodiak-user 17 CD1A.260905.001.B1 16238327 release-keys";
+    }
+    if (strcmp(canary_name, "persist.sys.pif.fingerprint") == 0) {
+        return "google/kodiak/kodiak:17/CD1A.260905.001.B1/16238327:user/release-keys";
+    }
+    return nullptr;
+}
+
+static const char* read_staged_identity(const char* canary_name, char* buffer) {
+    if (is_wallet_process()) {
+        const char* pay = wallet_prop_name(canary_name);
+        if (pay && __system_property_get(pay, buffer) > 0) return buffer;
+        const char* builtin = wallet_builtin(canary_name);
+        if (builtin) return builtin;
+    }
+    if (__system_property_get(canary_name, buffer) > 0) return buffer;
+    return nullptr;
+}
+
 static const char* custom_rom_hide_get_prop_override_impl(const char* name, char* buffer) {
-    // Cached per pid once the process name is final. Wallet and the GMS process
-    // that runs TapAndPay have to see the same identity DroidGuard does: the
-    // certificate was already rewritten to it.
-    const bool identity = is_droidguard_process() || is_wallet_process();
-    // An exact entry from the PIF config wins over everything below, as in PIFork.
-    if (identity) {
+    // DroidGuard keeps the canary PIF config, including its custom entries.
+    // Wallet and TapAndPay use the stable identity only.
+    const bool droidguard = is_droidguard_process();
+    const bool identity = droidguard || is_wallet_process();
+    if (droidguard) {
         if (const char* v = find_custom_prop_override(name, buffer, false)) return v;
     }
     for (const PropOverride* o = kSpoofedValueProps; o->name; ++o) {
@@ -1095,29 +1144,24 @@ static const char* custom_rom_hide_get_prop_override_impl(const char* name, char
             if (!identity) return nullptr;
             // This code is also linked into the loader, which cannot contain ELF TLS.
             // The caller owns a PROP_VALUE_MAX buffer for the duration of the read.
-            int len = __system_property_get(o->staging_name, buffer);
-            if (len > 0) return buffer;
-            return nullptr; // staging prop unset — leave the real value alone
+            return read_staged_identity(o->staging_name, buffer);
         }
     }
     if (const char* staging = find_product_partition_staging(name)) {
         if (!identity) return nullptr;
-        int len = __system_property_get(staging, buffer);
-        if (len > 0) return buffer;
-        return nullptr;
+        return read_staged_identity(staging, buffer);
     }
     if (const DynamicSuffixOverride* o = find_dynamic_suffix_override(name)) {
         if (!identity) return nullptr;
-        int len = __system_property_get(o->staging_name, buffer);
-        if (len > 0) return buffer;
+        return read_staged_identity(o->staging_name, buffer);
     }
     for (const PropOverride* o = kDroidGuardValueProps; o->name; ++o) {
         if (strcmp(name, o->name) == 0) {
             return identity ? o->value : nullptr;
         }
     }
-    // Wildcard entries from the PIF config apply last, after the fixed tables.
-    if (identity) return find_custom_prop_override(name, buffer, true);
+    // Canary-only custom entries. Wallet must not inherit them.
+    if (droidguard) return find_custom_prop_override(name, buffer, true);
     return nullptr;
 }
 
