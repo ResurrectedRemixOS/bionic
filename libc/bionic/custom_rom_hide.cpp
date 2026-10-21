@@ -247,7 +247,6 @@ static bool read_cmdline_name(char* out, size_t out_size) {
     if (n <= 0) return false;
 
     out[n] = '\0';
-    if (char* colon = strchr(out, ':')) *colon = '\0';
     return true;
 }
 
@@ -256,7 +255,14 @@ static bool name_is_zygote(const char* name) {
     static const char kZygoteSuffix[] = "_zygote";
     size_t slen = sizeof(kZygoteSuffix) - 1;
     if (len >= slen && strcmp(name + len - slen, kZygoteSuffix) == 0) return true;
+    // Native app zygotes are "<process>_zygote_native". They drop to the app
+    // uid before setcon. Hiding seapp_contexts there fails the domain
+    // transition, the child never listens, and every later start waits on it.
+    static const char kNativeSuffix[] = "_zygote_native";
+    size_t nlen = sizeof(kNativeSuffix) - 1;
+    if (len >= nlen && strcmp(name + len - nlen, kNativeSuffix) == 0) return true;
     if (strcmp(name, "zygote") == 0 || strcmp(name, "zygote64") == 0) return true;
+    if (strcmp(name, "zygote_next") == 0 || strcmp(name, "zygote-child") == 0) return true;
     if (strcmp(name, "usap32") == 0 || strcmp(name, "usap64") == 0) return true;
     return false;
 }
@@ -267,7 +273,10 @@ static bool compute_exempt(bool* is_zygote) {
     char name[256];
     if (!read_cmdline_name(name, sizeof(name))) return false;
 
+    // Check the full cmdline first. Native zygotes are named
+    // "pkg:process_zygote_native", and cutting at ':' would hide the suffix.
     if (name_is_zygote(name)) { *is_zygote = true; return true; }
+    if (char* colon = strchr(name, ':')) *colon = '\0';
 
     for (const char* const* p = kAllowlistedPackages; *p; ++p) {
         if (strcmp(name, *p) == 0) return true;
