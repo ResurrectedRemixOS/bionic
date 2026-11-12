@@ -170,6 +170,7 @@ uint32_t __system_property_serial(const prop_info* pi) {
   uint32_t real_serial = atomic_load_explicit(&pi->serial, memory_order_acquire);
 
   if (!custom_rom_hide_is_app_process()) return real_serial;
+  if (custom_rom_hide_is_plain_prop(pi)) return real_serial;
 
   const char* name = pi->name;
   bool is_ro = (strncmp(name, "ro.", 3) == 0);
@@ -198,6 +199,7 @@ uint32_t __system_property_serial(const prop_info* pi) {
       }
   }
 
+  custom_rom_hide_note_plain_prop(pi);
   return real_serial;
 }
 

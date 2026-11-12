@@ -27,6 +27,8 @@ struct statx;
 __BEGIN_DECLS
 
 bool custom_rom_hide_is_app_process();
+bool custom_rom_hide_is_plain_prop(const void* pi);
+void custom_rom_hide_note_plain_prop(const void* pi);
 
 bool custom_rom_hide_should_block(const char* path);
 bool custom_rom_hide_should_block_at(int dirfd, const char* path);

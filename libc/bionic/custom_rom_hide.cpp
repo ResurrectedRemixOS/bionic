@@ -300,8 +300,28 @@ static bool is_exempt_process() {
     return result;
 }
 
+// A zygote child keeps its parent's name until it has taken the app's uid.
+static bool has_final_uid() {
+    char name[256];
+    return read_cmdline_name(name, sizeof(name)) && !name_is_zygote(name);
+}
+
 static bool is_app_process() {
-    if ((getuid() % AID_USER_OFFSET) < AID_APP_START) return false;
+    static _Atomic(pid_t) app_pid = -1;
+    static _Atomic(pid_t) system_pid = -1;
+
+    const pid_t cur = getpid();
+    if (atomic_load_explicit(&system_pid, memory_order_relaxed) == cur) return false;
+    if (atomic_load_explicit(&app_pid, memory_order_relaxed) != cur) {
+        const uid_t uid = getuid();
+        if ((uid % AID_USER_OFFSET) < AID_APP_START) {
+            if (uid != 0 && has_final_uid()) {
+                atomic_store_explicit(&system_pid, cur, memory_order_relaxed);
+            }
+            return false;
+        }
+        atomic_store_explicit(&app_pid, cur, memory_order_relaxed);
+    }
     if (is_exempt_process()) return false;
     return true;
 }
@@ -332,12 +352,13 @@ static bool compute_droidguard(bool* resolved) {
     return strcmp(cmdline, DROIDGUARD_PROCESS_NAME) == 0;
 }
 
-static bool is_droidguard_process() {
+static bool is_droidguard_process(bool* settled = nullptr) {
     static _Atomic(pid_t) cached_pid = -1;
     static _Atomic(bool) cached_value = false;
 
     pid_t cur = getpid();
     if (atomic_load_explicit(&cached_pid, memory_order_acquire) == cur) {
+        if (settled) *settled = true;
         return atomic_load_explicit(&cached_value, memory_order_acquire);
     }
 
@@ -347,6 +368,7 @@ static bool is_droidguard_process() {
         atomic_store_explicit(&cached_value, result, memory_order_release);
         atomic_store_explicit(&cached_pid, cur, memory_order_release);
     }
+    if (settled) *settled = resolved;
     return result;
 }
 
@@ -1186,6 +1208,22 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
 
 bool custom_rom_hide_is_app_process() {
     return is_app_process();
+}
+
+static _Atomic(const void*) plain_prop = nullptr;
+static _Atomic(pid_t) plain_prop_pid = -1;
+
+bool custom_rom_hide_is_plain_prop(const void* pi) {
+    return atomic_load(&plain_prop) == pi && atomic_load(&plain_prop_pid) == getpid();
+}
+
+void custom_rom_hide_note_plain_prop(const void* pi) {
+    // DroidGuard's overrides follow props that change.
+    bool settled = false;
+    if (is_droidguard_process(&settled) || !settled) return;
+    atomic_store(&plain_prop_pid, -1);
+    atomic_store(&plain_prop, pi);
+    atomic_store(&plain_prop_pid, getpid());
 }
 
 static const PartitionDevEntry* find_partition_entry(const char* path) {
