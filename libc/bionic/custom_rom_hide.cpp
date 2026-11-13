@@ -704,11 +704,46 @@ static char* read_file_raw(const char* path, size_t* out_size) {
     return buf;
 }
 
-typedef bool (*LinePredicate)(const char* line, void* ctx);
-typedef void (*LineWriter)(int mem_fd, char* line, size_t line_len, void* ctx);
+// Kept lines are batched into the memfd. One write() per line made an app's
+// maps read 1.8-2.9x as expensive, and a smaps read takes ~20 lines per VMA.
+struct OutBuf {
+    int fd;
+    char* data;
+    size_t len;
+    size_t cap;
+};
 
-static void write_line_raw(int mem_fd, char* line, size_t line_len, void*) {
-    raw_write(mem_fd, line, line_len);
+static void raw_write_all(int fd, const char* s, size_t n) {
+    while (n > 0) {
+        ssize_t w = raw_write(fd, s, n);
+        if (w <= 0) return;
+        s += w;
+        n -= static_cast<size_t>(w);
+    }
+}
+
+static void out_flush(OutBuf* out) {
+    raw_write_all(out->fd, out->data, out->len);
+    out->len = 0;
+}
+
+static void out_append(OutBuf* out, const char* s, size_t n) {
+    if (out->len + n > out->cap) {
+        out_flush(out);
+        if (n > out->cap) {
+            raw_write_all(out->fd, s, n);
+            return;
+        }
+    }
+    memcpy(out->data + out->len, s, n);
+    out->len += n;
+}
+
+typedef bool (*LinePredicate)(const char* line, void* ctx);
+typedef void (*LineWriter)(OutBuf* out, char* line, size_t line_len, void* ctx);
+
+static void write_line_raw(OutBuf* out, char* line, size_t line_len, void*) {
+    out_append(out, line, line_len);
 }
 
 static int filter_file_with(const char* path, LinePredicate drop, LineWriter writer, void* ctx) {
@@ -722,6 +757,11 @@ static int filter_file_with(const char* path, LinePredicate drop, LineWriter wri
         return -1;
     }
 
+    // Without the buffer every line goes straight to the memfd.
+    static constexpr size_t kOutBufSize = 64 * 1024;
+    OutBuf out = {mem_fd, static_cast<char*>(malloc(kOutBufSize)), 0, 0};
+    if (out.data) out.cap = kOutBufSize;
+
     char* pos = content;
     while (*pos) {
         char* eol = strchr(pos, '\n');
@@ -729,12 +769,14 @@ static int filter_file_with(const char* path, LinePredicate drop, LineWriter wri
         char saved = pos[line_len];
         pos[line_len] = '\0';
         if (!drop || !drop(pos, ctx)) {
-            (writer ? writer : write_line_raw)(mem_fd, pos, line_len, ctx);
+            (writer ? writer : write_line_raw)(&out, pos, line_len, ctx);
         }
         pos[line_len] = saved;
         pos += line_len;
     }
 
+    out_flush(&out);
+    free(out.data);
     free(content);
     raw_lseek(mem_fd, 0, SEEK_SET);
     return mem_fd;
@@ -779,7 +821,7 @@ static const MountDm kMountDm[] = {
     { nullptr,         nullptr },
 };
 
-static void write_spoofed_mount_line(int mem_fd, char* line, size_t line_len, void*) {
+static void write_spoofed_mount_line(OutBuf* out, char* line, size_t line_len, void*) {
     char* rw_delim = strstr(line, ",rw,");
     if (rw_delim) { rw_delim[1] = 'r'; rw_delim[2] = 'o'; }
     rw_delim = strstr(line, " rw,");
@@ -804,18 +846,41 @@ static void write_spoofed_mount_line(int mem_fd, char* line, size_t line_len, vo
             if (dev_start) {
                 char* dev_end = strchr(dev_start, ' ');
                 if (!dev_end) dev_end = dev_start + strlen(dev_start);
-                raw_write(mem_fd, line, dev_start - line);
-                raw_write(mem_fd, replacement, strlen(replacement));
-                raw_write(mem_fd, dev_end, line_len - (dev_end - line));
+                out_append(out, line, dev_start - line);
+                out_append(out, replacement, strlen(replacement));
+                out_append(out, dev_end, line_len - (dev_end - line));
                 return;
             }
         }
     }
-    raw_write(mem_fd, line, line_len);
+    out_append(out, line, line_len);
 }
 
-static bool drop_proc_line(const char* line, void* ctx) {
-    return should_filter_line(*static_cast<ProcFilterType*>(ctx), line);
+// A VMA line starts "lo-hi ". In smaps each one is followed by "Key: value"
+// lines that belong to it.
+static bool is_vma_header(const char* line) {
+    auto hex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); };
+    const char* p = line;
+    if (!hex(*p)) return false;
+    while (hex(*p)) p++;
+    if (*p++ != '-' || !hex(*p)) return false;
+    while (hex(*p)) p++;
+    return *p == ' ';
+}
+
+struct ProcFilterCtx {
+    ProcFilterType type;
+    bool dropping_vma;
+};
+
+static bool drop_proc_line(const char* line, void* raw_ctx) {
+    ProcFilterCtx* ctx = static_cast<ProcFilterCtx*>(raw_ctx);
+    if (ctx->type != PROC_FILTER_MAPS) return should_filter_line(ctx->type, line);
+    // Test only the VMA lines, and drop a hidden VMA's smaps fields with it.
+    // They used to stay behind, attached to the VMA above.
+    if (!is_vma_header(line)) return ctx->dropping_vma;
+    ctx->dropping_vma = should_filter_line(ctx->type, line);
+    return ctx->dropping_vma;
 }
 
 int custom_rom_hide_filter_proc(const char* path) {
@@ -829,7 +894,8 @@ int custom_rom_hide_filter_proc(const char* path) {
     if (type != PROC_FILTER_CMDLINE) {
         LineWriter writer = (type == PROC_FILTER_MOUNTS || type == PROC_FILTER_MOUNTINFO)
                 ? write_spoofed_mount_line : write_line_raw;
-        int mem_fd = filter_file_with(path, drop_proc_line, writer, &type);
+        ProcFilterCtx ctx = {type, false};
+        int mem_fd = filter_file_with(path, drop_proc_line, writer, &ctx);
         errno = saved_errno;
         return mem_fd;
     }
