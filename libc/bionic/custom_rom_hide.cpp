@@ -276,6 +276,7 @@ static bool compute_exempt(bool* is_zygote) {
     // Check the full cmdline first. Native zygotes are named
     // "pkg:process_zygote_native", and cutting at ':' would hide the suffix.
     if (name_is_zygote(name)) { *is_zygote = true; return true; }
+    if (strcmp(name, "crash_dump64") == 0 || strcmp(name, "crash_dump32") == 0) return true;
     if (char* colon = strchr(name, ':')) *colon = '\0';
 
     for (const char* const* p = kAllowlistedPackages; *p; ++p) {
